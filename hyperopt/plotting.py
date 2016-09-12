@@ -5,7 +5,7 @@ Functions to visualize an Experiment.
 
 __authors__   = "James Bergstra"
 __license__   = "3-clause BSD License"
-__contact__   = "James Bergstra <pylearn-dev@googlegroups.com>"
+__contact__   = "github.com/hyperopt/hyperopt"
 
 import math
 import sys
@@ -38,7 +38,6 @@ def main_plot_history(trials, bandit=None, algo=None, do_show=True,
     # self is an Experiment
     if status_colors is None:
         status_colors = default_status_colors
-    Xs = trials.specs
 
     # XXX: show the un-finished or error trials
     Ys, colors = zip(*[(y, status_colors[s])
@@ -190,7 +189,7 @@ if 0:
 
         # save the sign of x
         sign = 1
-        if x < 0: 
+        if x < 0:
             sign = -1
         x = abs(x)
 
@@ -211,7 +210,7 @@ if 0:
         scores = list(scores) # shallow copy
         scores.sort()         # sort the copy
         scores.reverse()      # reverse the order
-        
+
         #this is valid for classification
         # where the scores are the means of Bernoulli variables.
         best_mean = scores[0][0]
@@ -240,7 +239,7 @@ if 0:
         scores = list(scores) # shallow copy
         scores.sort()         # sort the copy
         scores.reverse()      # reverse the order
-        
+
         # this is valid for classification
         # where the scores are the means of Bernoulli variables.
         best_mean = scores[0][0]
@@ -285,7 +284,7 @@ if 0:
         """
         Uses the current pyplot figure to show efficiency of random experiment.
 
-        :type scores: a list of (validation accuracy, test accuracy)  pairs 
+        :type scores: a list of (validation accuracy, test accuracy)  pairs
         :param scores: results from the trials of a random experiment
 
         :type n_valid: integer

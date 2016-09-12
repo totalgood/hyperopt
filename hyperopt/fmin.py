@@ -5,6 +5,7 @@ except ImportError:
 
 import functools
 import logging
+import os
 import sys
 import time
 
@@ -132,8 +133,6 @@ class FMinIter(object):
         block_until_done  means that the process blocks until ALL jobs in
         trials are not in running or new state
 
-        suggest() can pass instance of StopExperiment to break out of
-        enqueuing loop
         """
         trials = self.trials
         algo = self.algo
@@ -155,18 +154,15 @@ class FMinIter(object):
                             d['result'].get('status'))
                 new_trials = algo(new_ids, self.domain, trials,
                                   self.rstate.randint(2 ** 31 - 1))
-                if new_trials is base.StopExperiment:
+                assert len(new_ids) >= len(new_trials)
+                if len(new_trials):
+                    self.trials.insert_trial_docs(new_trials)
+                    self.trials.refresh()
+                    n_queued += len(new_trials)
+                    qlen = get_queue_len()
+                else:
                     stopped = True
                     break
-                else:
-                    assert len(new_ids) >= len(new_trials)
-                    if len(new_trials):
-                        self.trials.insert_trial_docs(new_trials)
-                        self.trials.refresh()
-                        n_queued += len(new_trials)
-                        qlen = get_queue_len()
-                    else:
-                        break
 
             if self.async:
                 # -- wait for workers to fill in the trials
@@ -234,7 +230,7 @@ def fmin(fn, space, algo, max_evals, trials=None, rstate=None,
         dictionary will be stored and available later as some 'result'
         sub-dictionary within `trials.trials`.
 
-    space : pyll.Apply node
+    space : hyperopt.pyll.Apply node
         The set of possible arguments to `fn` is the set of objects
         that could be created with non-zero probability by drawing randomly
         from this stochastic program involving involving hp_<xxx> nodes
@@ -254,9 +250,13 @@ def fmin(fn, space, algo, max_evals, trials=None, rstate=None,
         a trials object, then that trials object will be affected by
         side-effect of this call.
 
-    rstate : numpy.RandomState, default numpy.random
+    rstate : numpy.RandomState, default numpy.random or `$HYPEROPT_FMIN_SEED`
         Each call to `algo` requires a seed value, which should be different
         on each call. This object is used to draw these seeds via `randint`.
+        The default rstate is
+        `numpy.random.RandomState(int(env['HYPEROPT_FMIN_SEED']))`
+        if the `HYPEROPT_FMIN_SEED` environment variable is set to a non-empty
+        string, otherwise np.random is used in whatever state it is in.
 
     verbose : int
         Print out some information to stdout during search.
@@ -288,7 +288,11 @@ def fmin(fn, space, algo, max_evals, trials=None, rstate=None,
 
     """
     if rstate is None:
-        rstate = np.random.RandomState()
+        env_rseed = os.environ.get('HYPEROPT_FMIN_SEED', '')
+        if env_rseed:
+            rstate = np.random.RandomState(int(env_rseed))
+        else:
+            rstate = np.random.RandomState()
 
     if allow_trials_fmin and hasattr(trials, 'fmin'):
         return trials.fmin(

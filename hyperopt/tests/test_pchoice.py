@@ -1,8 +1,7 @@
 from functools import partial
 import numpy as np
 import unittest
-from sklearn import datasets
-from hyperopt import hp, Trials, fmin, tpe, rand
+from hyperopt import hp, Trials, fmin, tpe, anneal, rand
 import hyperopt.pyll.stochastic
 
 
@@ -102,7 +101,7 @@ class TestSimpleFMin(unittest.TestCase):
         # test that that a space with a pchoice in it is
         # (a) accepted by tpe.suggest and
         # (b) handled correctly.
-        N = 50
+        N = 150
         fmin(self.objective,
             space=self.space,
             trials=self.trials,
@@ -121,6 +120,19 @@ class TestSimpleFMin(unittest.TestCase):
             space=self.space,
             trials=self.trials,
             algo=partial(tpe.suggest, n_startup_jobs=10),
+            max_evals=N)
+
+        a_vals = [t['misc']['vals']['a'][0] for t in self.trials.trials]
+        counts = np.bincount(a_vals)
+        print counts
+        assert counts[3] > N * .6
+
+    def test_anneal(self):
+        N = 100
+        fmin(self.objective,
+            space=self.space,
+            trials=self.trials,
+            algo=partial(anneal.suggest),
             max_evals=N)
 
         a_vals = [t['misc']['vals']['a'][0] for t in self.trials.trials]
@@ -148,5 +160,16 @@ def test_bug1_tpe():
     best = fmin(fn=lambda x: 1,
                 space=space,
                 algo=tpe.suggest,
+                max_evals=50)
+
+def test_bug1_anneal():
+    space = hp.choice('preprocess_choice', [
+        {'pwhiten': hp.pchoice('whiten_randomPCA',
+                               [(.3, False), (.7, True)])},
+        {'palgo': False},
+        {'pthree': 7}])
+    best = fmin(fn=lambda x: 1,
+                space=space,
+                algo=anneal.suggest,
                 max_evals=50)
 

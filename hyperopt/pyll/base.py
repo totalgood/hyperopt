@@ -5,6 +5,7 @@
 
 import copy
 import logging; logger = logging.getLogger(__name__)
+import operator
 import time
 
 from StringIO import StringIO
@@ -118,17 +119,37 @@ class SymbolTable(object):
 
     # ----
 
+
+    def _define(self, f, o_len, pure):
+        name = f.__name__
+        entry = SymbolTableEntry(self, name, o_len, pure)
+        setattr(self, name, entry)
+        self._impls[name] = f
+        return f
+
     def define(self, f, o_len=None, pure=False):
         """Decorator for adding python functions to self
         """
         name = f.__name__
         if hasattr(self, name):
             raise ValueError('Cannot override existing symbol', name)
+        return self._define(f, o_len, pure)
 
-        entry = SymbolTableEntry(self, name, o_len, pure)
-        setattr(self, name, entry)
-        self._impls[name] = f
-        return f
+    def define_if_new(self, f, o_len=None, pure=False):
+        """Pass silently if f matches the current implementation
+        for f.__name__"""
+        name = f.__name__
+        if hasattr(self, name) and self._impls[name] is not f:
+            raise ValueError('Cannot redefine existing symbol', name)
+        return self._define(f, o_len, pure)
+
+    def undefine(self, f):
+        if isinstance(f, basestring):
+            name = f
+        else:
+            name = f.__name__
+        del self._impls[name]
+        delattr(self, name)
 
     def define_pure(self, f):
         return self.define(f, o_len=None, pure=True)
@@ -218,7 +239,8 @@ class Apply(object):
 
     def __init__(self, name, pos_args, named_args,
             o_len=None,
-            pure=False):
+            pure=False,
+            define_params=None):
         self.name = name
         # -- tuples or arrays -> lists
         self.pos_args = list(pos_args)
@@ -227,9 +249,18 @@ class Apply(object):
         #    list coersion.
         self.o_len = o_len
         self.pure = pure
+        # -- define_params lets us cope with stuff that may be in the
+        #    SymbolTable on the master but not on the worker.
+        self.define_params = define_params
         assert all(isinstance(v, Apply) for v in pos_args)
         assert all(isinstance(v, Apply) for k, v in named_args)
         assert all(isinstance(k, basestring) for k, v in named_args)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # -- On deserialization, update scope if need be.
+        if self.define_params:
+            scope.define_if_new(**self.define_params)
 
     def eval(self, memo=None):
         """
@@ -263,8 +294,13 @@ class Apply(object):
             return rval
 
     def inputs(self):
-        rval = self.pos_args + [v for (k, v) in self.named_args]
-        assert all(isinstance(arg, Apply) for arg in rval)
+        # -- this function gets called a lot and it's not 100% safe to cache
+        #    so the if/else is a small optimization
+        if self.named_args:
+            rval = self.pos_args + [v for (k, v) in self.named_args]
+        else:
+            rval = self.pos_args
+        #assert all(isinstance(arg, Apply) for arg in rval)
         return rval
 
     @property
@@ -446,6 +482,12 @@ class Apply(object):
 
     def __rdiv__(self, other):
         return scope.div(other, self)
+
+    def __truediv__(self, other):
+        return scope.truediv(self, other)
+
+    def __rtruediv__(self, other):
+        return scope.truediv(other, self)
 
     def __floordiv__(self, other):
         return scope.floordiv(self, other)
@@ -646,14 +688,17 @@ def dfs(aa, seq=None, seqset=None):
     if seq is None:
         assert seqset is None
         seq = []
-        seqset = set()
+        seqset = {}
     # -- seqset is the set of all nodes we have seen (which may be still on
     #    the stack)
+    #    N.B. it used to be a stack, but now it's a dict mapping to inputs
+    #    because that's an optimization saving us from having to call inputs
+    #    so often.
     if aa in seqset:
         return
     assert isinstance(aa, Apply)
-    seqset.add(aa)
-    for ii in aa.inputs():
+    seqset[aa] = aa.inputs()
+    for ii in seqset[aa]:
         dfs(ii, seq, seqset)
     seq.append(aa)
     return seq
@@ -768,6 +813,13 @@ def rec_eval(expr, deepcopy_inputs=False, memo=None,
     else:
         memo = dict(memo)
 
+    # -- hack for speed
+    #    since the inputs are constant during rec_eval
+    #    but not constant in general
+    node_inputs = {}
+    node_list = []
+    dfs(node, node_list, seqset=node_inputs)
+
     # TODO: optimize dfs to not recurse past the items in memo
     #       this is especially important for evaluating Lambdas
     #       which cause rec_eval to recurse
@@ -776,14 +828,14 @@ def rec_eval(expr, deepcopy_inputs=False, memo=None,
     #      so that this iteration may be an incomplete
     if memo_gc:
         clients = {}
-        for aa in dfs(node):
+        for aa in node_list:
             clients.setdefault(aa, set())
-            for ii in aa.inputs():
+            for ii in node_inputs[aa]:
                 clients.setdefault(ii, set()).add(aa)
         def set_memo(k, v):
             assert v is not GarbageCollected
             memo[k] = v
-            for ii in k.inputs():
+            for ii in node_inputs[k]:
                 # -- if all clients of ii are already in the memo
                 #    then we can free memo[ii] by replacing it
                 #    with a dummy symbol
@@ -833,7 +885,7 @@ def rec_eval(expr, deepcopy_inputs=False, memo=None,
             continue
         else:
             # -- normal instruction-type nodes have inputs
-            waiting_on = [v for v in node.inputs() if v not in memo]
+            waiting_on = [v for v in node_inputs[node] if v not in memo]
 
         if waiting_on:
             # -- Necessary inputs have yet to be evaluated.
@@ -892,69 +944,32 @@ def pos_args(*args):
     return args
 
 
-@scope.define_pure
-def getitem(obj, idx):
-    return obj[idx]
-
 
 @scope.define_pure
 def identity(obj):
     return obj
 
 
-@scope.define_pure
-def add(a, b):
-    return a + b
-
-
-@scope.define_pure
-def sub(a, b):
-    return a - b
-
-
-@scope.define_pure
-def neg(a):
-    return -a
-
-
-@scope.define_pure
-def mul(a, b):
-    return a * b
-
-
-@scope.define_pure
-def div(a, b):
-    return a / b
-
-
-@scope.define_pure
-def floordiv(a, b):
-    return a // b
-
-
-@scope.define_pure
-def eq(a, b):
-    return a == b
-
-
-@scope.define_pure
-def gt(a, b):
-    return a > b
-
-
-@scope.define_pure
-def ge(a, b):
-    return a >= b
-
-
-@scope.define_pure
-def lt(a, b):
-    return a < b
-
-
-@scope.define_pure
-def le(a, b):
-    return a <= b
+# -- We used to define these as Python functions in this file, but the operator
+#    module already provides them, is slightly more efficient about it. Since
+#    searchspaces uses the same convention, we can more easily map graphs back
+#    and forth and reduce the amount of code in both codebases.
+scope.define_pure(operator.getitem)
+scope.define_pure(operator.add)
+scope.define_pure(operator.sub)
+scope.define_pure(operator.mul)
+try:
+    scope.define_pure(operator.div)
+except AttributeError:
+    pass  # No more operator.div in Python3, but truediv also exists since Python2.2
+scope.define_pure(operator.truediv)
+scope.define_pure(operator.floordiv)
+scope.define_pure(operator.neg)
+scope.define_pure(operator.eq)
+scope.define_pure(operator.lt)
+scope.define_pure(operator.le)
+scope.define_pure(operator.gt)
+scope.define_pure(operator.ge)
 
 
 @scope.define_pure

@@ -3,7 +3,7 @@
 
 __authors__ = "James Bergstra"
 __license__ = "3-clause BSD License"
-__contact__ = "github.com/jaberg/hyperopt"
+__contact__ = "github.com/hyperopt/hyperopt"
 
 import copy
 from collections import deque
@@ -257,5 +257,16 @@ class SuggestAlgo(ExprEvaluator):
             return self.on_node_hyperparameter(memo, node, label)
         else:
             return ExprEvaluator.on_node(self, memo, node)
+
+    def batch(self, new_ids):
+        new_ids = list(new_ids)
+        self.rng.seed([self._seed] + new_ids)
+        memo = self.eval_nodes(
+            memo={
+                self.domain.s_new_ids: new_ids,
+                self.domain.s_rng: self.rng,
+            })
+        idxs, vals = memo[self.expr]
+        return idxs, vals
 
 # -- flake-8 abhors blank line EOF

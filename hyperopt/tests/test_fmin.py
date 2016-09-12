@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 import nose.tools
 
-from hyperopt import fmin, rand, tpe, hp, Trials, exceptions, space_eval
+from hyperopt import fmin, rand, tpe, hp, Trials, exceptions, space_eval, STATUS_FAIL, STATUS_OK
 from hyperopt.base import JOB_STATE_ERROR
 
 
@@ -107,12 +107,12 @@ def test_set_fmin_rstate():
 
 
 class TestFmin(unittest.TestCase):
-    class BanditE(Exception):
-        #XXX also test Bandit.exceptions mechanism that actually catches this
+    class SomeError(Exception):
+        #XXX also test domain.exceptions mechanism that actually catches this
         pass
 
     def eval_fn(self, space):
-        raise TestFmin.BanditE()
+        raise TestFmin.SomeError()
 
     def setUp(self):
         self.trials = Trials()
@@ -137,7 +137,7 @@ class TestFmin(unittest.TestCase):
         assert trials._dynamic_trials[1]['misc']['error'] != None
 
     def test_catch_eval_exceptions_False(self):
-        with self.assertRaises(TestFmin.BanditE):
+        with self.assertRaises(TestFmin.SomeError):
             fmin(self.eval_fn,
                  space=hp.uniform('x', 0, 1),
                  algo=rand.suggest,
@@ -148,4 +148,19 @@ class TestFmin(unittest.TestCase):
         assert len(self.trials) == 0
         assert len(self.trials._dynamic_trials) == 1
 
+def test_status_fail_tpe():
+    trials = Trials()
+
+    argmin = fmin(
+            fn=lambda x: ( {'loss': (x - 3) ** 2, 'status': STATUS_OK} if (x < 0) else
+                           {'status': STATUS_FAIL}),
+            space=hp.uniform('x', -5, 5),
+            algo=tpe.suggest,
+            max_evals=50,
+            trials=trials)
+
+    assert len(trials) == 50, len(trials)
+    assert argmin['x'] < 0, argmin
+    assert trials.best_trial['result'].has_key('loss'), trials.best_trial['result'].has_key('loss')
+    assert trials.best_trial['result']['loss'] >= 9, trials.best_trial['result']['loss']
 

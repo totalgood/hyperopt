@@ -11,26 +11,24 @@ import numpy as np
 import nose
 import nose.plugins.skip
 
-from hyperopt.bandits import gauss_wave2
 from hyperopt.base import JOB_STATE_DONE
 from hyperopt.mongoexp import MongoTrials
 from hyperopt.mongoexp import MongoWorker
 from hyperopt.mongoexp import ReserveTimeout
 from hyperopt.mongoexp import as_mongo_str
 from hyperopt.mongoexp import main_worker_helper
-
 from hyperopt.mongoexp import MongoJobs
-
 from hyperopt.fmin import fmin
 from hyperopt import rand
-
 import hyperopt.tests.test_base
+from test_domains import gauss_wave2
 
 def skiptest(f):
     def wrapper(*args, **kwargs):
         raise nose.plugins.skip.SkipTest()
     wrapper.__name__ = f.__name__
     return wrapper
+
 
 class TempMongo(object):
     """
@@ -50,7 +48,6 @@ class TempMongo(object):
             subprocess.call(["mkdir", "-p", '%s/db' % self.workdir])
             proc_args = [ "mongod",
                         "--dbpath=%s/db" % self.workdir,
-                        "--nojournal",
                          "--noprealloc",
                         "--port=22334"]
             #print "starting mongod", proc_args
@@ -150,7 +147,9 @@ def with_mongo_trials(f, exp_key=None):
 def _worker_thread_fn(host_id, n_jobs, timeout, dbname='foo', logfilename=None):
     mw = MongoWorker(
         mj=TempMongo.mongo_jobs(dbname),
-        logfilename=logfilename)
+        logfilename=logfilename,
+        workdir="mongoexp_test_dir",
+    )
     try:
         while n_jobs:
             mw.run_one(host_id, timeout, erase_created_workdir=True)
@@ -248,6 +247,7 @@ def test_handles_are_independent():
 
 
 def passthrough(x):
+    assert os.path.split(os.getcwd()).count("mongoexp_test_dir") == 1, "cwd is %s" % os.getcwd()
     return x
 
 
@@ -257,7 +257,8 @@ class TestExperimentWithThreads(unittest.TestCase):
     def worker_thread_fn(host_id, n_jobs, timeout):
         mw = MongoWorker(
             mj=TempMongo.mongo_jobs('foodb'),
-            logfilename=None)
+            logfilename=None,
+            workdir="mongoexp_test_dir")
         while n_jobs:
             mw.run_one(host_id, timeout, erase_created_workdir=True)
             print('worker: %s ran job' % str(host_id))
@@ -288,10 +289,10 @@ class TestExperimentWithThreads(unittest.TestCase):
         # -- divided by 3 experiments: 4 jobs per fmin
         max_evals = (n_workers * jobs_per_thread) // len(exp_keys)
 
-        # -- should not matter which bandit is used here
-        bandit = gauss_wave2()
+        # -- should not matter which domain is used here
+        domain = gauss_wave2()
 
-        cPickle.dumps(bandit.expr)
+        cPickle.dumps(domain.expr)
         cPickle.dumps(passthrough)
 
 
@@ -310,7 +311,7 @@ class TestExperimentWithThreads(unittest.TestCase):
             fmin_threads = [
                 threading.Thread(
                     target=TestExperimentWithThreads.fmin_thread_fn,
-                    args=(bandit.expr, trials, max_evals, seed))
+                    args=(domain.expr, trials, max_evals, seed))
                 for seed, trials in zip(seeds, trials_list)]
 
             try:

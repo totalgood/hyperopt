@@ -13,25 +13,11 @@ except ImportError:
 from hyperopt import pyll
 from hyperopt.pyll import scope
 
-from hyperopt import Bandit
 from hyperopt import Trials
 
-from hyperopt.base import miscs_to_idxs_vals, as_bandit, STATUS_OK
+from hyperopt.base import miscs_to_idxs_vals, STATUS_OK
 
-from hyperopt.bandits import quadratic1
-from hyperopt.bandits import q1_lognormal
-from hyperopt.bandits import n_arms
-from hyperopt.bandits import distractor
-from hyperopt.bandits import gauss_wave
-from hyperopt.bandits import gauss_wave2
-from hyperopt.bandits import many_dists
-
-from hyperopt.pyll_utils import hp_choice
-from hyperopt.pyll_utils import hp_randint
-from hyperopt.pyll_utils import hp_uniform, hp_loguniform
-from hyperopt.pyll_utils import hp_quniform, hp_qloguniform
-from hyperopt.pyll_utils import hp_normal, hp_lognormal
-from hyperopt.pyll_utils import hp_qnormal, hp_qlognormal
+from hyperopt import hp
 
 from hyperopt.tpe import adaptive_parzen_normal_orig
 from hyperopt.tpe import GMM1
@@ -43,7 +29,9 @@ import hyperopt.rand as rand
 import hyperopt.tpe as tpe
 from hyperopt import fmin
 
-from test_bandits import CasePerBandit
+from test_domains import (
+    domain_constructor,
+    CasePerDomain)
 
 DO_SHOW = int(os.getenv('HYPEROPT_SHOW', '0'))
 
@@ -526,7 +514,7 @@ class TestQLGMM1Math(unittest.TestCase):
         self.work(q=2, low=1, high=4.1)
 
 
-class TestSuggest(unittest.TestCase, CasePerBandit):
+class TestSuggest(unittest.TestCase, CasePerDomain):
     def work(self):
         # -- smoke test that things simply run,
         #    for each type of several search spaces.
@@ -538,7 +526,7 @@ class TestSuggest(unittest.TestCase, CasePerBandit):
             max_evals=10)
 
 
-class TestOpt(unittest.TestCase, CasePerBandit):
+class TestOpt(unittest.TestCase, CasePerDomain):
     thresholds = dict(
             quadratic1=1e-5,
             q1_lognormal=0.01,
@@ -547,6 +535,7 @@ class TestOpt(unittest.TestCase, CasePerBandit):
             gauss_wave2=-2.0,
             n_arms=-2.5,
             many_dists=.0005,
+            branin=0.7,
             )
 
     LEN = dict(
@@ -559,6 +548,7 @@ class TestOpt(unittest.TestCase, CasePerBandit):
             q1_lognormal=250,
             gauss_wave2=75, # -- boosted from 50 on Nov/2013 after new
                             #  sampling order made thresh test fail.
+            branin=200,
             )
 
     gammas = dict(
@@ -590,7 +580,6 @@ class TestOpt(unittest.TestCase, CasePerBandit):
 
         bandit = self.bandit
         assert bandit.name is not None
-        print 'Bandit', bandit.name
         algo = partial(tpe.suggest,
                 gamma=self.gammas.get(bandit.name,
                     tpe._default_gamma),
@@ -607,6 +596,7 @@ class TestOpt(unittest.TestCase, CasePerBandit):
             algo=algo,
             trials=trials,
             max_evals=LEN,
+            rstate=np.random.RandomState(123),
             catch_eval_exceptions=False)
         assert len(trials) == LEN
 
@@ -651,48 +641,10 @@ class TestOpt(unittest.TestCase, CasePerBandit):
         assert min(trials.losses()) < thresh
 
 
-def notest_opt_qn_uniform():
-    notest_opt_qn_normal(hp_uniform)
-
-
-def notest_opt_qn_normal(f=hp_normal):
-    bandit = Bandit(
-            {'loss': scope.sum([f('v%i' % ii, 0, 1)
-                for ii in range(25)]) ** 2},
-            loss_target=0)
-    algo = TreeParzenEstimator(bandit,
-            prior_weight=.5,
-            n_startup_jobs=0,
-            n_EI_candidates=1,
-            gamma=0.15)
-    trials = Trials()
-    experiment = Experiment(trials, algo, async=False)
-    experiment.max_queue_len = 1
-    experiment.run(40)
-    print 'sorted losses:', list(sorted(trials.losses()))
-
-    idxs, vals = miscs_to_idxs_vals(trials.miscs)
-
-    if 1:
-        import hyperopt.plotting
-        hyperopt.plotting.main_plot_vars(trials, bandit, do_show=1)
-    else:
-        import matplotlib.pyplot as plt
-        begin = [v[:10] for k, v in vals.items()]
-        end = [v[-10:] for k, v in vals.items()]
-        plt.subplot(2, 1, 1)
-        plt.title('before')
-        plt.hist(np.asarray(begin).flatten())
-        plt.subplot(2, 1, 2)
-        plt.title('after')
-        plt.hist(np.asarray(end).flatten())
-        plt.show()
-
-
-@as_bandit(loss_target=0)
+@domain_constructor(loss_target=0)
 def opt_q_uniform(target):
     rng = np.random.RandomState(123)
-    x = hp_quniform('x', 1.01, 10, 1)
+    x = hp.quniform('x', 1.01, 10, 1)
     return {'loss': (x - target) ** 2 + scope.normal(0, 1, rng=rng),
             'status': STATUS_OK}
 

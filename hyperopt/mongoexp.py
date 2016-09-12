@@ -92,7 +92,7 @@ finalize the job in the database.
 
 __authors__ = ["James Bergstra", "Dan Yamins"]
 __license__ = "3-clause BSD License"
-__contact__ = "github.com/jaberg/hyperopt"
+__contact__ = "github.com/hyperopt/hyperopt"
 
 import copy
 try:
@@ -133,6 +133,7 @@ from .utils import coarse_utcnow
 from .utils import fast_isin
 from .utils import get_most_recent_inds
 from .utils import json_call
+from .utils import working_dir, temp_dir
 import plotting
 
 
@@ -158,7 +159,7 @@ class InvalidMongoTrial(InvalidTrial):
     pass
 
 
-class BanditSwapError(Exception):
+class DomainSwapError(Exception):
     """Raised when the search program tries to change the bandit attached to
     an experiment.
     """
@@ -244,16 +245,20 @@ def connection_with_tunnel(host='localhost',
                     )
             # -- give the subprocess time to set up
             time.sleep(.5)
-            connection = pymongo.Connection('127.0.0.1', local_port,
-                    document_class=SON)
+            connection = pymongo.MongoClient('127.0.0.1', local_port,
+                                             document_class=SON, w=1, j=True)
         else:
-            connection = pymongo.Connection(host, port, document_class=SON)
+            connection = pymongo.MongoClient(host, port, document_class=SON, w=1, j=True)
             if user:
                 if user == 'hyperopt':
                     authenticate_for_db(connection[auth_dbname])
                 else:
                     raise NotImplementedError()
             ssh_tunnel=None
+
+        # Note that the w=1 and j=True args to MongoClient above should:
+        # -- Ensure that changes are written to at least one server.
+        # -- Ensure that changes are written to the journal if there is one.
 
         return connection, ssh_tunnel
 
@@ -290,11 +295,37 @@ class MongoJobs(object):
     #
     """
     def __init__(self, db, jobs, gfs, conn, tunnel, config_name):
+        """
+        Parameters
+        ----------
+
+        db - Mongo Database (e.g. `Connection()[dbname]`)
+            database in which all job-related info is stored
+
+        jobs - Mongo Collection handle
+            collection within `db` to use for job arguments, return vals,
+            and various bookkeeping stuff and meta-data. Typically this is
+            `db['jobs']`
+
+        gfs - Mongo GridFS handle
+            GridFS is used to store attachments - binary blobs that don't fit
+            or are awkward to store in the `jobs` collection directly.
+
+        conn - Mongo Connection
+            Why we need to keep this, I'm not sure.
+
+        tunnel - something for ssh tunneling if you're doing that
+            See `connection_with_tunnel` for more info.
+
+        config_name - string
+            XXX: No idea what this is for, seems unimportant.
+
+        """
         self.db = db
         self.jobs = jobs
         self.gfs = gfs
-        self.conn=conn
-        self.tunnel=tunnel
+        self.conn = conn
+        self.tunnel = tunnel
         self.config_name = config_name
 
     # TODO: rename jobs -> coll throughout
@@ -339,17 +370,17 @@ class MongoJobs(object):
         self.create_drivers_indexes()
 
     def jobs_complete(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_DONE))
+        c = self.jobs.find(filter=dict(state=JOB_STATE_DONE))
         return c if cursor else list(c)
 
     def jobs_error(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_ERROR))
+        c = self.jobs.find(filter=dict(state=JOB_STATE_ERROR))
         return c if cursor else list(c)
 
     def jobs_running(self, cursor=False):
         if cursor:
             raise NotImplementedError()
-        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING)))
+        rval = list(self.jobs.find(filter=dict(state=JOB_STATE_RUNNING)))
         #TODO: mark some as MIA
         rval = [r for r in rval if not r.get('MIA', False)]
         return rval
@@ -357,38 +388,46 @@ class MongoJobs(object):
     def jobs_dead(self, cursor=False):
         if cursor:
             raise NotImplementedError()
-        rval = list(self.jobs.find(spec=dict(state=JOB_STATE_RUNNING)))
+        rval = list(self.jobs.find(filter=dict(state=JOB_STATE_RUNNING)))
         #TODO: mark some as MIA
         rval = [r for r in rval if r.get('MIA', False)]
         return rval
 
     def jobs_queued(self, cursor=False):
-        c = self.jobs.find(spec=dict(state=JOB_STATE_NEW))
+        c = self.jobs.find(filter=dict(state=JOB_STATE_NEW))
         return c if cursor else list(c)
 
-    def insert(self, job, safe=True):
+    def insert(self, job):
         """Return a job dictionary by inserting the job dict into the database"""
         try:
             cpy = copy.deepcopy(job)
-            # this call adds an _id field to cpy
-            _id = self.jobs.insert(cpy, safe=safe, check_keys=True)
-            # so now we return the dict with the _id field
+            # -- this call adds an _id field to cpy
+            _id = self.jobs.insert(cpy, check_keys=True)
+            # -- so now we return the dict with the _id field
             assert _id == cpy['_id']
             return cpy
         except pymongo.errors.OperationFailure, e:
+            # -- translate pymongo error class into hyperopt error class
+            #    This was meant to make it easier to catch insertion errors
+            #    in a generic way even if different databases were used.
+            #    ... but there's just MongoDB so far, so kinda goofy.
             raise OperationFailure(e)
 
-    def delete(self, job, safe=True):
+    def delete(self, job):
         """Delete job[s]"""
         try:
-            self.jobs.remove(job, safe=safe)
+            self.jobs.remove(job)
         except pymongo.errors.OperationFailure, e:
+            # -- translate pymongo error class into hyperopt error class
+            #    see insert() code for rationale.
             raise OperationFailure(e)
 
-    def delete_all(self, cond={}, safe=True):
+    def delete_all(self, cond=None):
         """Delete all jobs and attachments"""
+        if cond is None:
+            cond = {}
         try:
-            for d in self.jobs.find(spec=cond, fields=['_id', '_attachments']):
+            for d in self.jobs.find(filter=cond, projection=['_id', '_attachments']):
                 logger.info('deleting job %s' % d['_id'])
                 for name, file_id in d.get('_attachments', []):
                     try:
@@ -396,12 +435,14 @@ class MongoJobs(object):
                     except gridfs.errors.NoFile:
                         logger.error('failed to remove attachment %s:%s' % (
                             name, file_id))
-                self.jobs.remove(d, safe=safe)
+                self.jobs.remove(d)
         except pymongo.errors.OperationFailure, e:
+            # -- translate pymongo error class into hyperopt error class
+            #    see insert() code for rationale.
             raise OperationFailure(e)
 
-    def delete_all_error_jobs(self, safe=True):
-        return self.delete_all(cond={'state': JOB_STATE_ERROR}, safe=safe)
+    def delete_all_error_jobs(self):
+        return self.delete_all(cond={'state': JOB_STATE_ERROR})
 
     def reserve(self, host_id, cond=None, exp_key=None):
         now = coarse_utcnow()
@@ -414,7 +455,7 @@ class MongoJobs(object):
             cond['exp_key'] = exp_key
 
         #having an owner of None implies state==JOB_STATE_NEW, so this effectively
-        #acts as a filter to make sure that only new jobs get reserved. 
+        #acts as a filter to make sure that only new jobs get reserved.
         if cond.get('owner') is not None:
             raise ValueError('refusing to reserve owned job')
         else:
@@ -432,24 +473,21 @@ class MongoJobs(object):
                      }
                  },
                 new=True,
-                safe=True,
                 upsert=False)
         except pymongo.errors.OperationFailure, e:
             logger.error('Error during reserve_job: %s'%str(e))
             rval = None
         return rval
 
-    def refresh(self, doc, safe=False):
-        self.update(doc, dict(refresh_time=coarse_utcnow()), safe=False)
+    def refresh(self, doc):
+        self.update(doc, dict(refresh_time=coarse_utcnow()))
 
-    def update(self, doc, dct, safe=True, collection=None):
+    def update(self, doc, dct, collection=None, do_sanity_checks=True):
         """Return union of doc and dct, after making sure that dct has been
         added to doc in `collection`.
 
         This function does not modify either `doc` or `dct`.
 
-        safe=True means error-checking is done. safe=False means this function will succeed
-        regardless of what happens with the db.
         """
         if collection is None:
             collection = self.coll
@@ -479,17 +517,17 @@ class MongoJobs(object):
             collection.update(
                     doc_query,
                     {'$set': dct},
-                    safe=True,
                     upsert=False,
                     multi=False,)
         except pymongo.errors.OperationFailure, e:
-            # translate pymongo failure into generic failure
+            # -- translate pymongo error class into hyperopt error class
+            #    see insert() code for rationale.
             raise OperationFailure(e)
 
         # update doc in-place to match what happened on the server side
         doc.update(dct)
 
-        if safe:
+        if do_sanity_checks:
             server_doc = collection.find_one(
                     dict(_id=doc['_id'], version=doc['version']))
             if server_doc is None:
@@ -667,21 +705,21 @@ class MongoTrials(Trials):
         _trials = orig_trials[:] #copy to make sure it doesn't get screwed up
         if _trials:
             db_data = list(self.handle.jobs.find(query,
-                                            fields=['_id', 'version']))
+                                            projection=['_id', 'version']))
             # -- pull down a fresh list of ids from mongo
             if db_data:
                 #make numpy data arrays
                 db_data = numpy.rec.array([(x['_id'], int(x['version']))
-                                        for x in db_data], 
+                                        for x in db_data],
                                         names=['_id', 'version'])
                 db_data.sort(order=['_id', 'version'])
                 db_data = db_data[get_most_recent_inds(db_data)]
-                
+
                 existing_data = numpy.rec.array([(x['_id'],
                                               int(x['version'])) for x in _trials],
                                               names=['_id', 'version'])
                 existing_data.sort(order=['_id', 'version'])
-                
+
                 #which records are in db but not in existing, and vice versa
                 db_in_existing = fast_isin(db_data['_id'], existing_data['_id'])
                 existing_in_db = fast_isin(existing_data['_id'], db_data['_id'])
@@ -692,8 +730,8 @@ class MongoTrials(Trials):
                 #new data is what's in db that's not in existing
                 new_data = db_data[numpy.invert(db_in_existing)]
 
-                #having removed the new and out of data data, 
-                #concentrating on data in db and existing for state changes 
+                #having removed the new and out of data data,
+                #concentrating on data in db and existing for state changes
                 db_data = db_data[db_in_existing]
                 existing_data = existing_data[existing_in_db]
                 try:
@@ -706,12 +744,12 @@ class MongoTrials(Trials):
                                       str(numpy.random.randint(1e8)) + '.pkl')
                     logger.error('HYPEROPT REFRESH ERROR: writing error file to %s' % reportpath)
                     _file = open(reportpath, 'w')
-                    cPickle.dump({'db_data': db_data, 
+                    cPickle.dump({'db_data': db_data,
                                   'existing_data': existing_data},
                                 _file)
                     _file.close()
                     raise
-                    
+
                 same_version = existing_data['version'] == db_data['version']
                 _trials = [_trials[_ind] for _ind in same_version.nonzero()[0]]
                 version_changes = existing_data[numpy.invert(same_version)]
@@ -728,12 +766,12 @@ class MongoTrials(Trials):
                 _trials = []
         else:
             #this case is for performance, though should be able to be removed
-            #without breaking correctness. 
+            #without breaking correctness.
             _trials = list(self.handle.jobs.find(query))
             if _trials:
                 _trials = [_trials[_i] for _i in get_most_recent_inds(_trials)]
             num_new = len(_trials)
-            
+
         logger.debug('Refresh data download took %f seconds for %d ids' %
                          (time.time() - t0, num_new))
 
@@ -762,7 +800,7 @@ class MongoTrials(Trials):
     def _insert_trial_docs(self, docs):
         rval = []
         for doc in docs:
-            rval.append(self.handle.jobs.insert(doc, safe=True))
+            rval.append(self.handle.jobs.insert(doc))
         return rval
 
     def count_by_state_unsynced(self, arg):
@@ -805,9 +843,9 @@ class MongoTrials(Trials):
         db = self.handle.db
         # N.B. that the exp key is *not* used here. It was once, but it caused
         # a nasty bug: tids were generated by a global experiment
-        # with exp_key=None, running a BanditAlgo that introduced sub-experiments
+        # with exp_key=None, running a suggest() that introduced sub-experiments
         # with exp_keys, which ran jobs that did result injection.  The tids of
-        # injected jobs were sometimes unique within an experiment, and 
+        # injected jobs were sometimes unique within an experiment, and
         # sometimes not. Hilarious!
         #
         # Solution: tids are generated to be unique across the db, not just
@@ -822,8 +860,7 @@ class MongoTrials(Trials):
             doc = db.job_ids.find_and_modify(
                     query,
                     {'$inc' : {'last_id': N}},
-                    upsert=True,
-                    safe=True)
+                    upsert=True)
             if doc is None:
                 logger.warning('no last_id found, re-trying')
                 time.sleep(1.0)
@@ -994,26 +1031,6 @@ class MongoWorker(object):
         else:
             workdir = self.workdir
         workdir = os.path.abspath(os.path.expanduser(workdir))
-        cwd = os.getcwd()
-        sentinal = None
-        if not os.path.isdir(workdir):
-            # -- figure out the closest point to the workdir in the filesystem
-            closest_dir = ''
-            for wdi in os.path.split(workdir):
-                if os.path.isdir(os.path.join(closest_dir, wdi)):
-                    closest_dir = os.path.join(closest_dir, wdi)
-                else:
-                    break
-            assert closest_dir != workdir
-
-            # -- touch a sentinal file so that recursive directory
-            #    removal stops at the right place
-            sentinal = os.path.join(closest_dir, wdi + '.inuse')
-            logger.debug("touching sentinal file: %s" % sentinal)
-            open(sentinal, 'w').close()
-            # -- now just make the rest of the folders
-            logger.debug("making workdir: %s" % workdir)
-            os.makedirs(workdir)
         try:
             root_logger = logging.getLogger()
             if self.logfilename:
@@ -1053,8 +1070,9 @@ class MongoWorker(object):
                 else:
                     raise ValueError('Unrecognized cmd protocol', cmd_protocol)
 
-                result = worker_fn(spec, ctrl)
-                result = SONify(result)
+                with temp_dir(workdir, erase_created_workdir), working_dir(workdir):
+                    result = worker_fn(spec, ctrl)
+                    result = SONify(result)
             except BaseException, e:
                 #XXX: save exception to database, but if this fails, then
                 #      at least raise the original traceback properly
@@ -1062,13 +1080,11 @@ class MongoWorker(object):
                 ctrl.checkpoint()
                 mj.update(job,
                         {'state': JOB_STATE_ERROR,
-                        'error': (str(type(e)), str(e))},
-                        safe=True)
+                        'error': (str(type(e)), str(e))})
                 raise
         finally:
             if self.logfilename:
                 root_logger.removeHandler(self.log_handler)
-            os.chdir(cwd)
 
         logger.info('job finished: %s' % str(job['_id']))
         attachments = result.pop('attachments', {})
@@ -1078,22 +1094,7 @@ class MongoWorker(object):
                     aname, len(aval)))
             ctrl.attachments[aname] = aval
         ctrl.checkpoint(result)
-        mj.update(job, {'state': JOB_STATE_DONE}, safe=True)
-
-        if sentinal:
-            if erase_created_workdir:
-                logger.debug('MongoWorker.run_one: rmtree %s' % workdir)
-                shutil.rmtree(workdir)
-                # -- put it back so that recursive removedirs works
-                os.mkdir(workdir)
-                # -- recursive backtrack to sentinal
-                logger.debug('MongoWorker.run_one: removedirs %s'
-                             % workdir)
-                os.removedirs(workdir)
-            # -- remove sentinal
-            logger.debug('MongoWorker.run_one: rm %s' % sentinal)
-            os.remove(sentinal)
-
+        mj.update(job, {'state': JOB_STATE_DONE})
 
 class MongoCtrl(Ctrl):
     """

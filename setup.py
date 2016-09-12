@@ -6,6 +6,7 @@
 import logging
 import os
 import re
+import sys
 
 # ----- overrides -----
 
@@ -31,23 +32,6 @@ debug = True
 # -------------------------
 
 if debug: logging.basicConfig(level=logging.DEBUG)
-# distribute import and testing
-try:
-    import distribute_setup
-    distribute_setup.use_setuptools()
-    logging.debug("distribute_setup.py imported and used")
-except ImportError:
-    # fallback to setuptools?
-    # distribute_setup.py was not in this directory
-    if not (setup_tools_fallback):
-        import setuptools
-        if not (hasattr(setuptools,'_distribute') and \
-                setuptools._distribute):
-            raise ImportError("distribute was not found and fallback to setuptools was not allowed")
-        else:
-            logging.debug("distribute_setup.py not found, defaulted to system distribute")
-    else:
-        logging.debug("distribute_setup.py not found, defaulting to system setuptools")
 
 import setuptools
 
@@ -70,7 +54,7 @@ def find_subdirectories(package):
     This will include resources (non-submodules) and submodules
     """
     try:
-        subdirectories = os.walk(package_to_path(package)).next()[1]
+        subdirectories = next(os.walk(package_to_path(package)))[1]
     except StopIteration:
         subdirectories = []
     return subdirectories
@@ -120,12 +104,16 @@ if package_data is None: package_data = find_package_data(packages)
 
 if scripts is None: scripts = find_scripts()
 
+extra = {}
+if sys.version_info >= (3,):
+    extra['use_2to3'] = True
+
 setuptools.setup(
     name = package_name,
     version = '0.0.3.dev',
     packages = packages,
     scripts = scripts,
-    url = 'http://jaberg.github.com/hyperopt/',
+    url = 'http://hyperopt.github.com/hyperopt/',
     author = 'James Bergstra',
     author_email = 'james.bergstra@gmail.com',
     description = 'Distributed Asynchronous Hyperparameter Optimization',
@@ -142,6 +130,8 @@ setuptools.setup(
         'Operating System :: POSIX',
         'Operating System :: Unix',
         'Programming Language :: Python',
+        'Programming Language :: Python :: 2',
+        'Programming Language :: Python :: 3',
         'Topic :: Scientific/Engineering',
         'Topic :: Software Development',
     ],
@@ -150,10 +140,11 @@ setuptools.setup(
     keywords = 'Bayesian optimization hyperparameter model selection',
     package_data = package_data,
     include_package_data = True,
-    install_requires = reversed([
+    install_requires = list(reversed([
         'numpy',
         'scipy',
         'nose',
         'pymongo',
-        'networkx']),
+        'networkx'])),
+    **extra
 )

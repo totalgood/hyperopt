@@ -4,22 +4,17 @@ The design is that there are three components fitting together in this project:
 
 - Trials - a list of documents including at least sub-documents:
     ['spec'] - the specification of hyper-parameters for a job
-    ['result'] - the result of Bandit.evaluate(). Typically includes:
+    ['result'] - the result of Domain.evaluate(). Typically includes:
         ['status'] - one of the STATUS_STRINGS
         ['loss'] - real-valued scalar that hyperopt is trying to minimize
     ['idxs'] - compressed representation of spec
     ['vals'] - compressed representation of spec
     ['tid'] - trial id (unique in Trials list)
 
-- Bandit - specifies a search problem
-
-- BanditAlgo - an algorithm for solving a Bandit search problem
-
-- Experiment - uses a Bandit and a BanditAlgo to carry out a search by
-         interacting with a Trials object.
+- Domain - specifies a search problem
 
 - Ctrl - a channel for two-way communication
-         between an Experiment and Bandit.evaluate.
+         between an Experiment and Domain.evaluate.
          Experiment subclasses may subclass Ctrl to match. For example, if an
          experiment is going to dispatch jobs in other threads, then an
          appropriate thread-aware Ctrl subclass should go with it.
@@ -28,16 +23,21 @@ The design is that there are three components fitting together in this project:
 
 __authors__ = "James Bergstra"
 __license__ = "3-clause BSD License"
-__contact__ = "github.com/jaberg/hyperopt"
+__contact__ = "github.com/hyperopt/hyperopt"
 
 import logging
 import datetime
+import os
 import sys
 
 import numpy as np
 
-import bson  # -- comes with pymongo
-from bson.objectid import ObjectId
+try:
+    import bson  # -- comes with pymongo
+    from bson.objectid import ObjectId
+    have_bson = True
+except ImportError:
+    have_bson = False
 
 import pyll
 #from pyll import scope  # looks unused but
@@ -45,7 +45,6 @@ from pyll.stochastic import recursive_set_rng_kwarg
 
 from .exceptions import (
     DuplicateLabel, InvalidTrial, InvalidResultStatus, InvalidLoss)
-from .pyll_utils import hp_choice
 from .utils import pmin_sampled
 from .utils import use_obj_for_literal_in_memo
 from .vectorize import VectorizeHelper
@@ -54,11 +53,10 @@ logger = logging.getLogger(__name__)
 
 
 # -- STATUS values
-# These are used to store job status in a backend-agnostic way, for the
-# purpose of communicating between Bandit, BanditAlgo, and any
-# visualization/monitoring code.
+#    An eval_fn returning a dictionary must have a status key with
+#    one of these values. They are used by optimization routines
+#    and plotting functions.
 
-# -- named constants for status possibilities
 STATUS_NEW = 'new'
 STATUS_RUNNING = 'running'
 STATUS_SUSPENDED = 'suspended'
@@ -74,9 +72,9 @@ STATUS_STRINGS = (
 
 
 # -- JOBSTATE values
-# These are used to store job states for the purpose of scheduling and running
-# Bandit.evaluate.  These values are used to communicate between an Experiment
-# and a worker process.
+# These are used internally by the scheduler.
+# These values are used to communicate between an Experiment
+# and a worker process. Consider moving them to mongoexp.
 
 # -- named constants for job execution pipeline
 JOB_STATE_NEW = 0
@@ -112,17 +110,9 @@ def _all_same(*args):
     return 1 == len(set(args))
 
 
-def StopExperiment(*args, **kwargs):
-    """ Return StopExperiment
-
-    StopExperiment is a symbol used as a special return value from
-    BanditAlgo.suggest. With this implementation both `return StopExperiment`
-    and `return StopExperiment()` have the same effect.
-    """
-    return StopExperiment
-
-
 def SONify(arg, memo=None):
+    if not have_bson:
+        return arg
     add_arg_to_raise = True
     try:
         if memo is None:
@@ -155,7 +145,7 @@ def SONify(arg, memo=None):
         else:
             add_arg_to_raise = False
             raise TypeError('SONify', arg)
-    except Exception, e:
+    except Exception as e:
         if add_arg_to_raise:
             e.args = e.args + (arg,)
         raise
@@ -176,36 +166,21 @@ def miscs_update_idxs_vals(miscs, idxs, vals,
     if idxs_map is None:
         idxs_map = {}
 
-    def imap(i):
-        return idxs_map.get(i, i)
-
     assert set(idxs.keys()) == set(vals.keys())
 
     misc_by_id = dict([(m['tid'], m) for m in miscs])
+    for m in miscs:
+        m['idxs'] = dict([(key, []) for key in idxs])
+        m['vals'] = dict([(key, []) for key in idxs])
 
-    if idxs and assert_all_vals_used:
-        # -- Assert that every val will be used to update some doc.
-        all_ids = set()
-        for idxlist in idxs.values():
-            all_ids.update(map(imap, idxlist))
-        assert all_ids == set(misc_by_id.keys())
+    for key in idxs:
+        assert len(idxs[key]) == len(vals[key])
+        for tid, val in zip(idxs[key], vals[key]):
+            tid = idxs_map.get(tid, tid)
+            if assert_all_vals_used or tid in misc_by_id:
+                misc_by_id[tid]['idxs'][key] = [tid]
+                misc_by_id[tid]['vals'][key] = [val]
 
-    for tid, misc_tid in misc_by_id.items():
-        misc_tid['idxs'] = {}
-        misc_tid['vals'] = {}
-        for node_id in idxs:
-            node_idxs = map(imap, idxs[node_id])
-            node_vals = vals[node_id]
-            if tid in node_idxs:
-                pos = node_idxs.index(tid)
-                misc_tid['idxs'][node_id] = [tid]
-                misc_tid['vals'][node_id] = [node_vals[pos]]
-
-                # -- assert that tid occurs only once
-                assert tid not in node_idxs[pos+1:]
-            else:
-                misc_tid['idxs'][node_id] = []
-                misc_tid['vals'][node_id] = []
     return miscs
 
 
@@ -334,14 +309,14 @@ class Trials(object):
         try:
             return iter(self._trials)
         except AttributeError:
-            print >> sys.stderr, "You have to refresh before you iterate"
+            print(sys.stderr, "You have to refresh before you iterate")
             raise
 
     def __len__(self):
         try:
             return len(self._trials)
         except AttributeError:
-            print >> sys.stderr, "You have to refresh before you compute len"
+            print(sys.stderr, "You have to refresh before you compute len")
             raise
 
     def __getitem__(self, item):
@@ -383,19 +358,23 @@ class Trials(object):
         return [tt['misc'] for tt in self._trials]
 
     @property
+    def idxs_vals(self):
+        return miscs_to_idxs_vals(self.miscs)
+
+    @property
     def idxs(self):
-        return miscs_to_idxs_vals(self.miscs)[0]
+        return self.idxs_vals[0]
 
     @property
     def vals(self):
-        return miscs_to_idxs_vals(self.miscs)[1]
+        return self.idxs_vals[1]
 
     def assert_valid_trial(self, trial):
         if not (hasattr(trial, 'keys') and hasattr(trial, 'values')):
             raise InvalidTrial('trial should be dict-like', trial)
         for key in TRIAL_KEYS:
             if key not in trial:
-                raise InvalidTrial('trial missing key', key)
+                raise InvalidTrial('trial missing key %s', key)
         for key in TRIAL_MISC_KEYS:
             if key not in trial['misc']:
                 raise InvalidTrial('trial["misc"] missing key', key)
@@ -404,15 +383,16 @@ class Trials(object):
                 'tid mismatch between root and misc',
                 trial)
         # -- check for SON-encodable
-        try:
-            bson.BSON.encode(trial)
-        except:
-            # TODO: save the trial object somewhere to inspect, fix, re-insert
-            #       so that precious data is not simply deallocated and lost.
-            print '-' * 80
-            print "CANT ENCODE"
-            print '-' * 80
-            raise
+        if have_bson:
+            try:
+                bson.BSON.encode(trial)
+            except:
+                # TODO: save the trial object somewhere to inspect, fix, re-insert
+                #       so that precious data is not simply deallocated and lost.
+                print('-' * 80)
+                print("CANT ENCODE")
+                print('-' * 80)
+                raise
         if trial['exp_key'] != self._exp_key:
             raise InvalidTrial('wrong exp_key',
                                (trial['exp_key'], self._exp_key))
@@ -546,7 +526,7 @@ class Trials(object):
         Average best error is defined as the average of bandit.true_loss,
         weighted by the probability that the corresponding bandit.loss is best.
 
-        For bandits with loss measurement variance of 0, this function simply
+        For domains with loss measurement variance of 0, this function simply
         returns the true_loss corresponding to the result with the lowest loss.
         """
 
@@ -594,6 +574,8 @@ class Trials(object):
 
     @property
     def best_trial(self):
+        """Trial with lowest loss and status=STATUS_OK
+        """
         candidates = [t for t in self.trials
                       if t['result']['status'] == STATUS_OK]
         losses = [float(t['result']['loss']) for t in candidates]
@@ -721,43 +703,68 @@ class Ctrl(object):
         return self.trials.insert_trial_docs(new_trials)
 
 
-class Bandit(object):
-    """Specification of bandit problem.
-
-    template - pyll specification of search domain
-
-    evaluate - interruptible/checkpt calling convention for evaluation routine
+class Domain(object):
+    """Picklable representation of search space and evaluation function.
 
     """
+    rec_eval_print_node_on_error = False
+
     # -- the Ctrl object is not used directly, but rather
     #    a live Ctrl instance is inserted for the pyll_ctrl
     #    in self.evaluate so that it can be accessed from within
     #    the pyll graph describing the search space.
     pyll_ctrl = pyll.as_apply(Ctrl)
 
-    exceptions = []
-
-    def __init__(self, expr,
+    def __init__(self, fn, expr,
+                 workdir=None,
+                 pass_expr_memo_ctrl=None,
                  name=None,
                  loss_target=None,
-                 exceptions=None,
-                 do_checks=True,
                  ):
-        if do_checks:
-            if isinstance(expr, pyll.Apply):
-                self.expr = expr
-                # XXX: verify that expr is a dictionary with the right keys,
-                #      then refactor the code below
-            elif isinstance(expr, dict):
-                if 'loss' not in expr:
-                    raise ValueError('expr must define a loss')
-                if 'status' not in expr:
-                    expr['status'] = STATUS_OK
-                self.expr = pyll.as_apply(expr)
-            else:
-                raise TypeError('expr must be a dictionary')
+        """
+        Paramaters
+        ----------
+
+        fn : callable
+            This stores the `fn` argument to `fmin`. (See `hyperopt.fmin.fmin`)
+
+        expr : hyperopt.pyll.Apply
+            This is the `space` argument to `fmin`. (See `hyperopt.fmin.fmin`)
+
+        workdir : string (or None)
+            If non-None, the current working directory will be `workdir`while
+            `expr` and `fn` are evaluated. (XXX Currently only respected by
+            jobs run via MongoWorker)
+
+        pass_expr_memo_ctrl : bool
+            If True, `fn` will be called like this:
+            `fn(self.expr, memo, ctrl)`,
+            where `memo` is a dictionary mapping `Apply` nodes to their
+            computed values, and `ctrl` is a `Ctrl` instance for communicating
+            with a Trials database.  This lower-level calling convention is
+            useful if you want to call e.g. `hyperopt.pyll.rec_eval` yourself
+            in some customized way.
+
+        name : string (or None)
+            Label, used for pretty-printing.
+
+        loss_target : float (or None)
+            The actual or estimated minimum of `fn`.
+            Some optimization algorithms may behave differently if their first
+            objective is to find an input that achieves a certain value,
+            rather than the more open-ended objective of pure minimization.
+            XXX: Move this from Domain to be an fmin arg.
+
+        """
+        self.fn = fn
+        if pass_expr_memo_ctrl is None:
+            self.pass_expr_memo_ctrl = getattr(fn,
+                                               'fmin_pass_expr_memo_ctrl',
+                                               False)
         else:
-            self.expr = pyll.as_apply(expr)
+            self.pass_expr_memo_ctrl = pass_expr_memo_ctrl
+
+        self.expr = pyll.as_apply(expr)
 
         self.params = {}
         for node in pyll.dfs(self.expr):
@@ -767,117 +774,9 @@ class Bandit(object):
                     raise DuplicateLabel(label)
                 self.params[label] = node.arg['obj']
 
-        if exceptions is not None:
-            self.exceptions = exceptions
         self.loss_target = loss_target
         self.name = name
 
-    def memo_from_config(self, config):
-        memo = {}
-        for node in pyll.dfs(self.expr):
-            if node.name == 'hyperopt_param':
-                label = node.arg['label'].obj
-                # -- hack because it's not really garbagecollected
-                #    this does have the desired effect of crashing the
-                #    function if rec_eval actually needs a value that
-                #    the the optimization algorithm thought to be unnecessary
-                memo[node] = config.get(label, pyll.base.GarbageCollected)
-        return memo
-
-    def short_str(self):
-        return self.__class__.__name__
-
-    def use_obj_for_literal_in_memo(self, obj, lit, memo):
-        return use_obj_for_literal_in_memo(self.expr, obj, lit, memo)
-
-    def evaluate(self, config, ctrl):
-        """Return a result document
-        """
-        memo = self.memo_from_config(config)
-        self.use_obj_for_literal_in_memo(ctrl, Ctrl, memo)
-        if self.rng is not None and not self.installed_rng:
-            # -- N.B. this modifies the expr graph in-place
-            #    XXX this feels wrong
-            self.expr = recursive_set_rng_kwarg(self.expr,
-                                                pyll.as_apply(self.rng))
-            self.installed_rng = True
-        try:
-            r_dct = pyll.rec_eval(self.expr, memo=memo)
-        except Exception, e:
-            n_match = 0
-            for match, match_pair in self.exceptions:
-                if match(e):
-                    r_dct = match_pair(e)
-                    n_match += 1
-                    break
-            if n_match == 0:
-                raise
-        assert 'loss' in r_dct
-        if r_dct['loss'] is not None:
-            # -- assert that it can at least be cast to float
-            float(r_dct['loss'])
-        if r_dct['status'] not in STATUS_STRINGS:
-            raise ValueError('invalid status string', r_dct['status'])
-        return r_dct
-
-    def loss(self, result, config=None):
-        """Extract the scalar-valued loss from a result document
-        """
-        return result.get('loss', None)
-
-    def loss_variance(self, result, config=None):
-        """Return the variance in the estimate of the loss"""
-        return result.get('loss_variance', 0.0)
-
-    def true_loss(self, result, config=None):
-        """Return a true loss, in the case that the `loss` is a surrogate"""
-        # N.B. don't use get() here, it evaluates self.loss un-necessarily
-        try:
-            return result['true_loss']
-        except KeyError:
-            return self.loss(result, config=config)
-
-    def true_loss_variance(self, config=None):
-        """Return the variance in  true loss,
-        in the case that the `loss` is a surrogate.
-        """
-        raise NotImplementedError()
-
-    def status(self, result, config=None):
-        """Extract the job status from a result document
-        """
-        return result['status']
-
-    def new_result(self):
-        """Return a JSON-encodable object
-        to serve as the 'result' for new jobs.
-        """
-        return {'status': STATUS_NEW}
-
-
-class Domain(Bandit):
-    """
-    Picklable representation of search space and evaluation function.
-    """
-    # TODO: Merge with Bandit -- two classes are not necessary
-    rec_eval_print_node_on_error = False
-
-    def __init__(self, fn, expr,
-                 workdir=None,
-                 pass_expr_memo_ctrl=None,
-                 **bandit_kwargs):
-        self.cmd = ('domain_attachment', 'FMinIter_Domain')
-        self.fn = fn
-        if pass_expr_memo_ctrl is None:
-            self.pass_expr_memo_ctrl = getattr(fn,
-                                               'fmin_pass_expr_memo_ctrl',
-                                               False)
-        else:
-            self.pass_expr_memo_ctrl = pass_expr_memo_ctrl
-        Bandit.__init__(self, expr, do_checks=False, **bandit_kwargs)
-
-        # -- This code was stolen from base.BanditAlgo, a class which may soon
-        #    be gone
         self.workdir = workdir
         self.s_new_ids = pyll.Literal('new_ids')  # -- list at eval-time
         before = pyll.dfs(self.expr)
@@ -904,9 +803,28 @@ class Domain(Bandit):
         # -- raises an exception if no topological ordering exists
         pyll.toposort(self.s_idxs_vals)
 
+        # -- Protocol for serialization.
+        #    self.cmd indicates to e.g. MongoWorker how this domain
+        #    should be [un]serialized.
+        #    XXX This mechanism deserves review as support for ipython
+        #        workers improves.
+        self.cmd = ('domain_attachment', 'FMinIter_Domain')
+
+    def memo_from_config(self, config):
+        memo = {}
+        for node in pyll.dfs(self.expr):
+            if node.name == 'hyperopt_param':
+                label = node.arg['label'].obj
+                # -- hack because it's not really garbagecollected
+                #    this does have the desired effect of crashing the
+                #    function if rec_eval actually needs a value that
+                #    the the optimization algorithm thought to be unnecessary
+                memo[node] = config.get(label, pyll.base.GarbageCollected)
+        return memo
+
     def evaluate(self, config, ctrl, attach_attachments=True):
         memo = self.memo_from_config(config)
-        self.use_obj_for_literal_in_memo(ctrl, Ctrl, memo)
+        use_obj_for_literal_in_memo(self.expr, ctrl, Ctrl, memo)
         if self.pass_expr_memo_ctrl:
             rval = self.fn(expr=self.expr, memo=memo, ctrl=ctrl)
         else:
@@ -945,40 +863,93 @@ class Domain(Bandit):
         #return base.SONify(dict_rval)
         return dict_rval
 
+    def evaluate_async(self, config, ctrl, attach_attachments=True,):
+        '''
+        this is the first part of async evaluation for ipython parallel engines (see ipy.py)
+
+        This breaks evaluate into two parts to allow for the apply_async call
+        to only pass the objective function and arguments.
+        '''
+        memo = self.memo_from_config(config)
+        use_obj_for_literal_in_memo(self.expr, ctrl, Ctrl, memo)
+        if self.pass_expr_memo_ctrl:
+            rval = self.fn(expr=self.expr, memo=memo, ctrl=ctrl)
+        else:
+            # -- the "work" of evaluating `config` can be written
+            #    either into the pyll part (self.expr)
+            #    or the normal Python part (self.fn)
+            pyll_rval = pyll.rec_eval(
+                self.expr,
+                memo=memo,
+                print_node_on_error=self.rec_eval_print_node_on_error)
+            return (self.fn,pyll_rval)
+    def evaluate_async2(self,rval,ctrl,attach_attachments=True):
+        '''
+        this is the second part of async evaluation for ipython parallel engines (see ipy.py)
+        '''
+        if isinstance(rval, (float, int, np.number)):
+            dict_rval = {'loss': float(rval), 'status': STATUS_OK}
+        else:
+            dict_rval = dict(rval)
+            status = dict_rval['status']
+            if status not in STATUS_STRINGS:
+                raise InvalidResultStatus(dict_rval)
+
+            if status == STATUS_OK:
+                # -- make sure that the loss is present and valid
+                try:
+                    dict_rval['loss'] = float(dict_rval['loss'])
+                except (TypeError, KeyError):
+                    raise InvalidLoss(dict_rval)
+
+        if attach_attachments:
+            attachments = dict_rval.pop('attachments', {})
+            for key, val in attachments.items():
+                ctrl.attachments[key] = val
+
+        # -- don't do this here because SON-compatibility is only a requirement
+        #    for trials destined for a mongodb. In-memory rvals can contain
+        #    anything.
+        #return base.SONify(dict_rval)
+        return dict_rval
+
+
     def short_str(self):
         return 'Domain{%s}' % str(self.fn)
 
+    def loss(self, result, config=None):
+        """Extract the scalar-valued loss from a result document
+        """
+        return result.get('loss', None)
 
-def as_bandit(**b_kwargs):
-    """
-    Decorate a function that returns a pyll expressions so that
-    it becomes a Bandit instance instead of a function
+    def loss_variance(self, result, config=None):
+        """Return the variance in the estimate of the loss"""
+        return result.get('loss_variance', 0.0)
 
-    Example:
+    def true_loss(self, result, config=None):
+        """Return a true loss, in the case that the `loss` is a surrogate"""
+        # N.B. don't use get() here, it evaluates self.loss un-necessarily
+        try:
+            return result['true_loss']
+        except KeyError:
+            return self.loss(result, config=config)
 
-    @as_bandit(loss_target=0)
-    def f(low, high):
-        return {'loss': hp_uniform('x', low, high) ** 2 }
+    def true_loss_variance(self, config=None):
+        """Return the variance in  true loss,
+        in the case that the `loss` is a surrogate.
+        """
+        raise NotImplementedError()
 
-    """
-    def deco(f):
-        def wrapper(*args, **kwargs):
-            if 'name' in b_kwargs:
-                _b_kwargs = b_kwargs
-            else:
-                _b_kwargs = dict(b_kwargs, name=f.__name__)
-            f_rval = f(*args, **kwargs)
-            domain = Domain(lambda x: x, f_rval, **_b_kwargs)
-            return domain
-        wrapper.__name__ = f.__name__
-        return wrapper
-    return deco
+    def status(self, result, config=None):
+        """Extract the job status from a result document
+        """
+        return result['status']
 
+    def new_result(self):
+        """Return a JSON-encodable object
+        to serve as the 'result' for new jobs.
+        """
+        return {'status': STATUS_NEW}
 
-@as_bandit()
-def coin_flip():
-    """ Possibly the simplest possible Bandit implementation
-    """
-    return {'loss': hp_choice('flip', [0.0, 1.0]), 'status': STATUS_OK}
 
 # -- flake8 doesn't like blank last line
